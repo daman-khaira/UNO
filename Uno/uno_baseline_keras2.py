@@ -12,12 +12,11 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import backend as K
 from tensorflow.keras import optimizers
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, Dense, Dropout
 from tensorflow.keras.callbacks import Callback, ModelCheckpoint, ReduceLROnPlateau, LearningRateScheduler, TensorBoard
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 from scipy.stats.stats import pearsonr
 from tensorflow.python import ipu
+from tensorflow.keras.models import Model
 
 import uno as benchmark
 
@@ -29,7 +28,7 @@ import candle
 
 import uno_data
 from uno_data import CombinedDataLoader, CombinedDataGenerator, DataFeeder, TFDataFeeder
-
+from model import build_model
 
 logger = logging.getLogger(__name__)
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -95,18 +94,6 @@ class LoggingCallback(Callback):
         self.print_fcn(msg)
 
 
-class PermanentDropout(Dropout):
-    def __init__(self, rate, **kwargs):
-        super(PermanentDropout, self).__init__(rate, **kwargs)
-        self.uses_learning_phase = False
-
-    def call(self, x, mask=None):
-        if 0. < self.rate < 1.:
-            noise_shape = self._get_noise_shape(x)
-            x = K.dropout(x, self.rate, noise_shape)
-        return x
-
-
 class MultiGPUCheckpoint(ModelCheckpoint):
 
     def set_model(self, model):
@@ -114,29 +101,6 @@ class MultiGPUCheckpoint(ModelCheckpoint):
             self.model = model.layers[-2]
         else:
             self.model = model
-
-
-def build_feature_model(input_shape, name='', dense_layers=[1000, 1000],
-                        kernel_initializer='glorot_normal',
-                        activation='relu', residual=False,
-                        dropout_rate=0, permanent_dropout=True):
-    x_input = Input(shape=input_shape)
-    h = x_input
-    for i, layer in enumerate(dense_layers):
-        x = h
-        h = Dense(layer, activation=activation, kernel_initializer=kernel_initializer)(h)
-        if dropout_rate > 0:
-            if permanent_dropout:
-                h = PermanentDropout(dropout_rate)(h)
-            else:
-                h = Dropout(dropout_rate)(h)
-        if residual:
-            try:
-                h = keras.layers.add([h, x])
-            except ValueError:
-                pass
-    model = Model(x_input, h, name=name)
-    return model
 
 
 class SimpleWeightSaver(Callback):
@@ -152,67 +116,6 @@ class SimpleWeightSaver(Callback):
 
     def on_train_end(self, logs={}):
         self.model.save_weights(self.fname)
-
-
-def build_model(loader, args, permanent_dropout=True, silent=False):
-    input_models = {}
-    dropout_rate = args.dropout
-
-    initializer = 'glorot_normal' if hasattr(args, 'initialization') is False else args.initialization
-    kernel_initializer = candle.build_initializer(initializer, candle.keras_default_config(), args.rng_seed)
-
-    for fea_type, shape in loader.feature_shapes.items():
-        base_type = fea_type.split('.')[0]
-        if base_type in ['cell', 'drug']:
-            if args.dense_cell_feature_layers is not None and base_type == 'cell':
-                dense_feature_layers = args.dense_cell_feature_layers
-            elif args.dense_drug_feature_layers is not None and base_type == 'drug':
-                dense_feature_layers = args.dense_drug_feature_layers
-            else:
-                dense_feature_layers = args.dense_feature_layers
-
-            box = build_feature_model(input_shape=shape, name=fea_type,
-                                      dense_layers=dense_feature_layers,
-                                      kernel_initializer=kernel_initializer,
-                                      dropout_rate=dropout_rate, permanent_dropout=permanent_dropout)
-            if not silent:
-                logger.debug('Feature encoding submodel for %s:', fea_type)
-                box.summary(print_fn=logger.debug)
-            input_models[fea_type] = box
-
-    inputs = []
-    encoded_inputs = []
-    for fea_name, fea_type in loader.input_features.items():
-        shape = loader.feature_shapes[fea_type]
-        fea_input = Input(shape, name='input.' + fea_name)
-        inputs.append(fea_input)
-        if fea_type in input_models:
-            input_model = input_models[fea_type]
-            encoded = input_model(fea_input)
-        else:
-            encoded = fea_input
-        encoded_inputs.append(encoded)
-
-    merged = keras.layers.concatenate(encoded_inputs)
-
-    h = merged
-    for i, layer in enumerate(args.dense):
-        x = h
-        h = Dense(layer, activation=args.activation, kernel_initializer=kernel_initializer)(h)
-        if dropout_rate > 0:
-            if permanent_dropout:
-                h = PermanentDropout(dropout_rate)(h)
-            else:
-                h = Dropout(dropout_rate)(h)
-        if args.residual:
-            try:
-                h = keras.layers.add([h, x])
-            except ValueError:
-                pass
-    output = Dense(1, kernel_initializer=kernel_initializer)(h)
-
-    return Model(inputs, output)
-
 
 def initialize_parameters(default_model='uno_default_model.txt'):
 
@@ -328,7 +231,7 @@ def run( params, ipu_strategy = None ):
             cv_ext = '.cv{}'.format(fold + 1)
 
         with ipu_strategy.scope():
-            model = build_model(loader, args, silent=True)
+            model = build_model(loader, args, logger=logger)
             if args.initial_weights:
                 logger.info("Loading initial weights from {}".format(args.initial_weights))
                 model.load_weights(args.initial_weights)
