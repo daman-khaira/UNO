@@ -3,7 +3,7 @@
 from __future__ import division, print_function
 
 import logging
-import os
+import os, sys
 
 import numpy as np
 import pandas as pd
@@ -20,6 +20,11 @@ from scipy.stats.stats import pearsonr
 from tensorflow.python import ipu
 
 import uno as benchmark
+
+# Import Candle libraries
+file_path = os.path.dirname(os.path.realpath(__file__))
+lib_path = os.path.abspath(os.path.join(file_path, '..', 'common'))
+sys.path.append(lib_path)
 import candle
 
 import uno_data
@@ -222,7 +227,7 @@ def initialize_parameters(default_model='uno_default_model.txt'):
     return gParameters
 
 
-def run(params):
+def run( params, ipu_strategy = None ):
     args = candle.ArgumentStruct(**params)
     candle.set_seed(args.rng_seed)
     ext = extension_from_parameters(args)
@@ -257,24 +262,7 @@ def run(params):
     val_split = args.val_split
     train_split = 1 - val_split
 
-    if args.export_csv:
-        fname = args.export_csv
-        loader.partition_data(cv_folds=args.cv, train_split=train_split, val_split=val_split,
-                              cell_types=args.cell_types, by_cell=args.by_cell, by_drug=args.by_drug,
-                              cell_subset_path=args.cell_subset_path, drug_subset_path=args.drug_subset_path)
-        train_gen = CombinedDataGenerator(loader, batch_size=args.batch_size, shuffle=args.shuffle)
-        val_gen = CombinedDataGenerator(loader, partition='val', batch_size=args.batch_size, shuffle=args.shuffle)
-
-        x_train_list, y_train = train_gen.get_slice(size=train_gen.size, dataframe=True, single=args.single)
-        x_val_list, y_val = val_gen.get_slice(size=val_gen.size, dataframe=True, single=args.single)
-        df_train = pd.concat([y_train] + x_train_list, axis=1)
-        df_val = pd.concat([y_val] + x_val_list, axis=1)
-        df = pd.concat([df_train, df_val]).reset_index(drop=True)
-        if args.growth_bins > 1:
-            df = uno_data.discretize(df, 'Growth', bins=args.growth_bins)
-        df.to_csv(fname, sep='\t', index=False, float_format="%.3g")
-        return
-
+    ### DATA EXPORT BLOCK: BEGIN  ###
     if args.export_data:
         fname = args.export_data
         loader.partition_data(cv_folds=args.cv, train_split=train_split, val_split=val_split,
@@ -282,7 +270,7 @@ def run(params):
                               cell_subset_path=args.cell_subset_path, drug_subset_path=args.drug_subset_path)
         train_gen = CombinedDataGenerator(loader, batch_size=args.batch_size, shuffle=args.shuffle)
         val_gen = CombinedDataGenerator(loader, partition='val', batch_size=args.batch_size, shuffle=args.shuffle)
-        store = pd.HDFStore(fname, complevel=9, complib='blosc')
+        store = pd.HDFStore(fname, complevel=9, complib='blosc:lz4')
 
         config_min_itemsize = {'Sample': 30, 'Drug1': 10}
         if not args.single:
@@ -295,8 +283,8 @@ def run(params):
 
                 for j, input_feature in enumerate(x_list):
                     input_feature.columns = [''] * len(input_feature.columns)
-                    store.append('x_{}_{}'.format(partition, j), input_feature.astype('float32'), format='table')
-                store.append('y_{}'.format(partition), y.astype({target: 'float32'}), format='table',
+                    store.append('x_{}_{}'.format(partition, j), input_feature.astype('float16'), format='table')
+                store.append('y_{}'.format(partition), y.astype({target: 'float16'}), format='table',
                              min_itemsize=config_min_itemsize)
                 logger.info('Generating {} dataset. {} / {}'.format(partition, i, gen.steps))
 
@@ -308,11 +296,9 @@ def run(params):
         store.close()
         logger.info('Completed generating {}'.format(fname))
         return
+    ### DATA EXPORT BLOCK: END  ###
 
-    if args.use_exported_data is None:
-        loader.partition_data(cv_folds=args.cv, train_split=train_split, val_split=val_split,
-                              cell_types=args.cell_types, by_cell=args.by_cell, by_drug=args.by_drug,
-                              cell_subset_path=args.cell_subset_path, drug_subset_path=args.drug_subset_path)
+    ## TODO: Make sure args.use_exported_data is not none
 
     model = build_model(loader, args)
     logger.info('Combined model:')
@@ -341,79 +327,60 @@ def run(params):
             logger.info('Cross validation fold {}/{}:'.format(fold + 1, cv))
             cv_ext = '.cv{}'.format(fold + 1)
 
-        template_model = build_model(loader, args, silent=True)
-        if args.initial_weights:
-            logger.info("Loading initial weights from {}".format(args.initial_weights))
-            template_model.load_weights(args.initial_weights)
+        with ipu_strategy.scope():
+            model = build_model(loader, args, silent=True)
+            if args.initial_weights:
+                logger.info("Loading initial weights from {}".format(args.initial_weights))
+                model.load_weights(args.initial_weights)
 
-        if len(args.gpus) > 1:
-            from tensorflow.keras.utils import multi_gpu_model
-            gpu_count = len(args.gpus)
-            logger.info("Multi GPU with {} gpus".format(gpu_count))
-            model = multi_gpu_model(template_model, cpu_merge=False, gpus=gpu_count)
-        else:
-            model = template_model
+            optimizer = optimizers.deserialize({'class_name': args.optimizer, 'config': {}})
+            base_lr = args.base_lr or K.get_value(optimizer.lr)
+            if args.learning_rate:
+                K.set_value(optimizer.lr, args.learning_rate)
 
-        optimizer = optimizers.deserialize({'class_name': args.optimizer, 'config': {}})
-        base_lr = args.base_lr or K.get_value(optimizer.lr)
-        if args.learning_rate:
-            K.set_value(optimizer.lr, args.learning_rate)
+            if args.use_exported_data is not None:
+                train_gen = TFDataFeeder(filename=args.use_exported_data, batch_size=args.batch_size, shuffle=args.shuffle, single=args.single, agg_dose=args.agg_dose, on_memory=args.on_memory_loader)
+                val_gen  = TFDataFeeder(partition='val', filename=args.use_exported_data, batch_size=args.batch_size, shuffle=args.shuffle, single=args.single, agg_dose=args.agg_dose, on_memory=args.on_memory_loader)
+                test_gen = TFDataFeeder(partition='test', filename=args.use_exported_data, batch_size=args.batch_size, shuffle=args.shuffle, single=args.single, agg_dose=args.agg_dose, on_memory=args.on_memory_loader)
+            else:
+                pass
 
-        if args.use_exported_data is not None:
-            train_gen = TFDataFeeder(filename=args.use_exported_data, batch_size=args.batch_size, shuffle=args.shuffle, single=args.single, agg_dose=args.agg_dose, on_memory=args.on_memory_loader)
-            val_gen  = TFDataFeeder(partition='val', filename=args.use_exported_data, batch_size=args.batch_size, shuffle=args.shuffle, single=args.single, agg_dose=args.agg_dose, on_memory=args.on_memory_loader)
-            test_gen = TFDataFeeder(partition='test', filename=args.use_exported_data, batch_size=args.batch_size, shuffle=args.shuffle, single=args.single, agg_dose=args.agg_dose, on_memory=args.on_memory_loader)
-        else:
-            train_gen = CombinedDataGenerator(loader, fold=fold, batch_size=args.batch_size, shuffle=args.shuffle, single=args.single)
-            val_gen = CombinedDataGenerator(loader, partition='val', fold=fold, batch_size=args.batch_size, shuffle=args.shuffle, single=args.single)
-            test_gen = CombinedDataGenerator(loader, partition='test', fold=fold, batch_size=args.batch_size, shuffle=args.shuffle, single=args.single)
+            # TODO: steps_per_execution must be a command line argument
+            model.compile(loss=args.loss, optimizer=optimizer, metrics=[candle.mae, candle.r2], steps_per_execution=train_gen.steps)
 
-        model.compile(loss=args.loss, optimizer=optimizer, metrics=[candle.mae, candle.r2], steps_per_execution=train_gen.steps)
-        # model.compile(loss=args.loss, optimizer=optimizer, metrics=[candle.mae, candle.r2], steps_per_execution=1)
+            # calculate trainable and non-trainable params
+            params.update(candle.compute_trainable_params(model))
 
-        # calculate trainable and non-trainable params
-        params.update(candle.compute_trainable_params(model))
+            candle_monitor = candle.CandleRemoteMonitor(params=params)
+            timeout_monitor = candle.TerminateOnTimeOut(params['timeout'])
+            es_monitor = keras.callbacks.EarlyStopping(patience=10, verbose=1)
 
-        candle_monitor = candle.CandleRemoteMonitor(params=params)
-        timeout_monitor = candle.TerminateOnTimeOut(params['timeout'])
-        es_monitor = keras.callbacks.EarlyStopping(patience=10, verbose=1)
+            reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=0.00001)
+            warmup_lr = LearningRateScheduler(warmup_scheduler)
+            checkpointer = MultiGPUCheckpoint(prefix + cv_ext + '.model.h5', save_best_only=True)
+            tensorboard = TensorBoard(log_dir="tb/{}{}{}".format(args.tb_prefix, ext, cv_ext))
+            history_logger = LoggingCallback(logger.debug)
 
-        reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=0.00001)
-        warmup_lr = LearningRateScheduler(warmup_scheduler)
-        checkpointer = MultiGPUCheckpoint(prefix + cv_ext + '.model.h5', save_best_only=True)
-        tensorboard = TensorBoard(log_dir="tb/{}{}{}".format(args.tb_prefix, ext, cv_ext))
-        history_logger = LoggingCallback(logger.debug)
+            callbacks = [candle_monitor, timeout_monitor, history_logger]
+            if args.es:
+                callbacks.append(es_monitor)
+            if args.reduce_lr:
+                callbacks.append(reduce_lr)
+            if args.warmup_lr:
+                callbacks.append(warmup_lr)
+            if args.cp:
+                callbacks.append(checkpointer)
+            if args.tb:
+                callbacks.append(tensorboard)
+            if args.save_weights:
+                logger.info("Will save weights to: " + args.save_weights)
+                callbacks.append(MultiGPUCheckpoint(args.save_weights))
 
-        callbacks = [candle_monitor, timeout_monitor, history_logger]
-        if args.es:
-            callbacks.append(es_monitor)
-        if args.reduce_lr:
-            callbacks.append(reduce_lr)
-        if args.warmup_lr:
-            callbacks.append(warmup_lr)
-        if args.cp:
-            callbacks.append(checkpointer)
-        if args.tb:
-            callbacks.append(tensorboard)
-        if args.save_weights:
-            logger.info("Will save weights to: " + args.save_weights)
-            callbacks.append(MultiGPUCheckpoint(args.save_weights))
+            df_val = val_gen.get_response(copy=True)
+            y_val = df_val[target].values
+            y_shuf = np.random.permutation(y_val)
+            log_evaluation(evaluate_prediction(y_val, y_shuf), logger, description='Between random pairs in y_val:')
 
-        df_val = val_gen.get_response(copy=True)
-        y_val = df_val[target].values
-        y_shuf = np.random.permutation(y_val)
-        log_evaluation(evaluate_prediction(y_val, y_shuf), logger,
-                       description='Between random pairs in y_val:')
-
-        if args.no_gen:
-            x_train_list, y_train = train_gen.get_slice(size=train_gen.size, single=args.single)
-            x_val_list, y_val = val_gen.get_slice(size=val_gen.size, single=args.single)
-            history = model.fit(x_train_list, y_train,
-                                batch_size=args.batch_size,
-                                epochs=args.epochs,
-                                callbacks=callbacks,
-                                validation_data=(x_val_list, y_val))
-        else:
             logger.info('Data points per epoch: train = %d, val = %d, test = %d', train_gen.size, val_gen.size, test_gen.size)
             logger.info('Steps per epoch: train = %d, val = %d, test = %d', train_gen.steps, val_gen.steps, test_gen.steps)
             history = model.fit(train_gen.tf_dataset,
@@ -425,19 +392,20 @@ def run(params):
                                 use_multiprocessing=False
                                 )
 
-        # prediction on holdout(test) when exists or use validation set
-        if test_gen.size > 0:
-            df_val = test_gen.get_response(copy=True)
-            y_val = df_val[target].values
-            y_val_pred = model.predict(test_gen.tf_dataset, steps=test_gen.steps + 1)
-            y_val_pred = y_val_pred[:test_gen.size]
-        else:
-            if args.no_gen:
-                y_val_pred = model.predict(x_val_list, batch_size=args.batch_size)
+            # prediction on holdout(test) when exists or use validation set
+            if test_gen.size > 0:
+                df_val = test_gen.get_response(copy=True)
+                y_val = df_val[target].values
+                y_val_pred = model.predict(test_gen.tf_dataset, steps=test_gen.steps + 1)
+                y_val_pred = y_val_pred[:test_gen.size]
             else:
                 val_gen.reset()
                 y_val_pred = model.predict(val_gen.tf_dataset, steps=val_gen.steps + 1)
                 y_val_pred = y_val_pred[:val_gen.size]
+
+            del train_gen
+            del val_gen
+            del test_gen
 
         y_val_pred = y_val_pred.flatten()
 
@@ -503,8 +471,7 @@ def main():
 
     # Create an execution strategy.
     strategy = ipu.ipu_strategy.IPUStrategy()
-    with strategy.scope():
-        run(params)
+    run(params, strategy)
 
 
 if __name__ == '__main__':
