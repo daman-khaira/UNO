@@ -1121,6 +1121,77 @@ class DataFeeder(keras.utils.Sequence):
         else:
             self.store.close()
 
+class TF_ON_MEMORY_DATA( ):
+
+    def __init__(self,  partition='train', filename=None, batch_size=32, shuffle=False, single=False, agg_dose=None, on_memory=False) -> None:
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.single = single
+        self.agg_dose = agg_dose
+        self.on_memory = on_memory
+        self.target = agg_dose if agg_dose is not None else 'Growth'
+        self.size = 0
+        self.steps = 0
+
+        fid = pd.HDFStore(filename, mode='r')
+
+        input_keys = list(filter(lambda x: x.startswith('/x_{}'.format(partition)), fid.keys()))
+        output_key = 'y_{}'.format(partition)
+        self.input_size = len(input_keys)
+
+        if self.input_size > 0:
+            try:
+                y = fid.select('y_{}'.format(partition))
+                self.index = y.index
+                self.target_loc = y.columns.get_loc(self.target)
+            except KeyError:
+                self.index = []
+
+            self.size = len(self.index)
+            if self.size >= self.batch_size:
+                self.steps = self.size // self.batch_size
+            else:
+                self.steps = 1
+                self.batch_size = self.size
+
+            self.index_map = np.arange(self.steps)
+            if self.shuffle:
+                np.random.shuffle(self.index_map)
+
+            # Get Inputs
+            input_list = []
+            # List all the training input keys
+            for keys in input_keys:
+                input_list.append( fid[keys].to_numpy() )
+            self.input = tuple(input_list)
+
+            # Get Output
+            self.output = fid[output_key].iloc[:,self.target_loc].to_numpy()
+
+        fid.close()
+
+    def __len__(self):
+        return self.steps
+    
+    def reset(self):
+        pass
+
+    def getDataset(self):
+        if self.size > 0:
+            ds = tf.data.Dataset.from_tensor_slices((self.input, self.output)).batch(self.batch_size, drop_remainder=True).prefetch(self.steps)
+            # if (self.shuffle):
+            #     ds = ds.shuffle(1000)
+            return ds
+        else:
+            return None
+
+    def get_response(self, copy=False):
+        if copy:
+            return np.copy(self.output)
+        else:
+            return self.output
+
+
 # Wrapper function for the keras.utils.Sequence class to generate batches in tf Dataset format
 class TFDataFeeder:
 
@@ -1130,7 +1201,10 @@ class TFDataFeeder:
         self.steps = self.data_feeder.steps
         self.tf_dataset = None
         if self.size > 0 and self.steps > 0:
-            self.tf_dataset = self.getTFDataset(self.data_feeder).repeat()
+            if on_memory:
+                self.tf_dataset = self.getTfdsFromTensorSlices(self.data_feeder).repeat()
+            else:
+                self.tf_dataset = self.getTfdsFromGenerator(self.data_feeder).repeat()
 
     def __len__(self):
         return self.data_feeder.steps
@@ -1138,7 +1212,7 @@ class TFDataFeeder:
     def getSize(self):
         return self.data_feeder.size
 
-    def getTFDataset(self, data_feeder: DataFeeder):
+    def getTfdsFromGenerator(self, data_feeder: DataFeeder):
 
         def convert2TF(x_list, y):
             # Convert the list to pandas dataframes to the tuple of numpy arrays
@@ -1164,6 +1238,12 @@ class TFDataFeeder:
         # output_shapes = (tf.TensorShape([8, 64, 64, 6]), tf.TensorShape([8, 3]))
         dataset = tf.data.Dataset.from_generator( generator, output_signature=getSpecs(data_feeder) )
         return dataset
+
+    def getTfdsFromTensorSlices(self, data_feeder: DataFeeder):
+        x = [ data_feeder.dataframe['x_{0}_{1}'.format(data_feeder.partition, i)].to_numpy() for i in range(data_feeder.input_size) ]
+        y = data_feeder.dataframe['y_{}'.format(data_feeder.partition)].iloc[:, data_feeder.target_loc]
+        ds = tf.data.Dataset.from_tensor_slices((tuple(x), y)).batch(data_feeder.batch_size, drop_remainder=True)
+        return ds
 
     def reset(self):
         self.data_feeder.reset()
