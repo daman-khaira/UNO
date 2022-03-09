@@ -214,7 +214,28 @@ additional_definitions = [
     {'name': 'save_weights',
         'type': str,
         'default': None,
-        'help': 'name of file to save weights to'}
+        'help': 'name of file to save weights to'},
+    {'name': 'use_tfrecords',
+        'type': str,
+        'default': None,
+        'help': 'use tensorflow records to train, validate'},
+
+
+    # IPU specific options
+    {'name': 'num_replicas',
+        'type': int,
+        'default': 1,
+        'help': 'number of devices to be used for data parallel mode'},
+    {'name': 'steps_per_execution',
+        'type': int,
+        'default': 1,
+        'help': 'number of batches for device to process in one run'},
+    {'name': 'gradient_accumulation_steps',
+        'type': int,
+        'default': 1,
+        'help': 'Number of steps over which gradient is accumulated'}
+
+
 ]
 
 required = [
