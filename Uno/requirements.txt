@@ -6,3 +6,5 @@ statsmodels
 tables
 astropy
 matplotlib
+scikit-learn
+tqdm
