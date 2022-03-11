@@ -3,7 +3,7 @@
 from __future__ import division, print_function
 
 import logging
-import os, sys
+import os, sys, shutil
 
 import numpy as np
 import pandas as pd
@@ -27,8 +27,9 @@ sys.path.append(lib_path)
 import candle
 
 import uno_data
-from uno_data import CombinedDataLoader, CombinedDataGenerator, DataFeeder, TFDataFeeder
+from uno_data import CombinedDataLoader, CombinedDataGenerator, DataFeeder, TFDataFeeder, TFRecordsHandler
 from model import build_model
+from uno_tfr_utils import *
 
 logger = logging.getLogger(__name__)
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -129,17 +130,7 @@ def initialize_parameters(default_model='uno_default_model.txt'):
 
     return gParameters
 
-
-def run( params, ipu_strategy = None ):
-    args = candle.ArgumentStruct(**params)
-    candle.set_seed(args.rng_seed)
-    ext = extension_from_parameters(args)
-    candle.verify_path(args.save_path)
-    prefix = args.save_path + ext
-    logfile = args.logfile if args.logfile else prefix + '.log'
-    candle.set_up_logger(logfile, logger, args.verbose)
-    logger.info('Params: {}'.format(params))
-
+def getDataLoader(args) -> CombinedDataLoader:
     loader = CombinedDataLoader(seed=args.rng_seed)
     loader.load(cache=args.cache,
                 ncols=args.feature_subsample,
@@ -160,46 +151,83 @@ def run( params, ipu_strategy = None ):
                 encode_response_source=not args.no_response_source,
                 use_exported_data=args.use_exported_data,
                 )
+    return loader
 
+def exportData(args: dict, loader:CombinedDataLoader):
+    fname = args.export_data
     target = args.agg_dose or 'Growth'
-    val_split = args.val_split
-    train_split = 1 - val_split
 
-    ### DATA EXPORT BLOCK: BEGIN  ###
-    if args.export_data:
-        fname = args.export_data
-        loader.partition_data(cv_folds=args.cv, train_split=train_split, val_split=val_split,
-                              cell_types=args.cell_types, by_cell=args.by_cell, by_drug=args.by_drug,
-                              cell_subset_path=args.cell_subset_path, drug_subset_path=args.drug_subset_path)
-        train_gen = CombinedDataGenerator(loader, batch_size=args.batch_size, shuffle=args.shuffle)
-        val_gen = CombinedDataGenerator(loader, partition='val', batch_size=args.batch_size, shuffle=args.shuffle)
-        store = pd.HDFStore(fname, complevel=9, complib='blosc:lz4')
+    loader.partition_data(cv_folds=args.cv, train_split=(1-args.val_split), val_split=args.val_split,
+                            cell_types=args.cell_types, by_cell=args.by_cell, by_drug=args.by_drug,
+                            cell_subset_path=args.cell_subset_path, drug_subset_path=args.drug_subset_path)
 
-        config_min_itemsize = {'Sample': 30, 'Drug1': 10}
-        if not args.single:
-            config_min_itemsize['Drug2'] = 10
+    config_min_itemsize = {'Sample': 30, 'Drug1': 10}
+    if not args.single:
+        config_min_itemsize['Drug2'] = 10
 
-        for partition in ['train', 'val']:
-            gen = train_gen if partition == 'train' else val_gen
-            for i in range(gen.steps):
-                x_list, y = gen.get_slice(size=args.batch_size, dataframe=True, single=args.single)
+    partitions = ['train', 'val', 'test']
 
+    # Open a pandas file handler
+    store = pd.HDFStore(fname, complevel=9, complib='blosc:lz4') if (args.export_data is not None) else None
+
+    # Record the feature length and array for TF Records
+    feature_len = 0
+    feature_arr = []
+    for _,val in loader.input_features.items():
+        curr_len = loader.feature_shapes[val][0]
+        feature_len += curr_len
+        feature_arr.append(curr_len)
+
+    tfr_writer = None
+    if args.export_tfrecords is not None:
+        tfr_writer = TFRecordsHandler( partition=partitions, write=True, directory=args.export_tfrecords, feature_len=feature_len, feature_sz_arr=feature_arr)
+
+    for partition in partitions:
+        gen = CombinedDataGenerator(loader, partition=partition, batch_size=args.batch_size, shuffle=args.shuffle)
+        for i in range(gen.steps):
+            logger.info('Generating {} dataset. {} / {}'.format(partition, i, gen.steps))
+            x_list, y = gen.get_slice(size=args.batch_size, dataframe=True, single=args.single)
+
+            if args.export_tfrecords is not None:
+                feature_mat = np.concatenate( [fi.values.astype(np.float32) for fi in x_list], axis=1)
+                y_arr = y[target].values.astype(np.float32)
+                tfr_writer.write_to_file(feature_mat, y_arr, partition)
+
+            if store is not None:
                 for j, input_feature in enumerate(x_list):
                     input_feature.columns = [''] * len(input_feature.columns)
-                    store.append('x_{}_{}'.format(partition, j), input_feature.astype('float16'), format='table')
-                store.append('y_{}'.format(partition), y.astype({target: 'float16'}), format='table',
-                             min_itemsize=config_min_itemsize)
-                logger.info('Generating {} dataset. {} / {}'.format(partition, i, gen.steps))
+                    store.append('x_{}_{}'.format(partition, j), input_feature.astype('float32'), format='table')
+                store.append('y_{}'.format(partition), y.astype({target: 'float32'}), format='table', min_itemsize=config_min_itemsize)
+            
 
-        # save input_features and feature_shapes from loader
+    # save input_features and feature_shapes from loader
+    if store is not None:
         store.put('model', pd.DataFrame())
         store.get_storer('model').attrs.input_features = loader.input_features
         store.get_storer('model').attrs.feature_shapes = loader.feature_shapes
 
         store.close()
-        logger.info('Completed generating {}'.format(fname))
-        return
-    ### DATA EXPORT BLOCK: END  ###
+    
+    logger.info('Completed generating {}'.format(fname))
+    return
+
+def run( params, ipu_strategy = None ):
+    args = candle.ArgumentStruct(**params)
+    candle.set_seed(args.rng_seed)
+    ext = extension_from_parameters(args)
+    candle.verify_path(args.save_path)
+    prefix = args.save_path + ext
+    logfile = args.logfile if args.logfile else prefix + '.log'
+    candle.set_up_logger(logfile, logger, args.verbose)
+    logger.info('Params: {}'.format(params))
+
+    loader = getDataLoader(args)
+
+    target = args.agg_dose or 'Growth'
+    val_split = args.val_split
+
+    if args.export_data or args.export_tfrecords:
+        return exportData(args, loader)
 
     ## TODO: Make sure args.use_exported_data is not none
 
@@ -242,14 +270,12 @@ def run( params, ipu_strategy = None ):
                 K.set_value(optimizer.lr, args.learning_rate)
 
             if args.use_exported_data is not None:
-                train_gen = TFDataFeeder(filename=args.use_exported_data, batch_size=args.batch_size, shuffle=args.shuffle, single=args.single, agg_dose=args.agg_dose, on_memory=args.on_memory_loader)
-                val_gen  = TFDataFeeder(partition='val', filename=args.use_exported_data, batch_size=args.batch_size, shuffle=args.shuffle, single=args.single, agg_dose=args.agg_dose, on_memory=args.on_memory_loader)
-                test_gen = TFDataFeeder(partition='test', filename=args.use_exported_data, batch_size=args.batch_size, shuffle=args.shuffle, single=args.single, agg_dose=args.agg_dose, on_memory=args.on_memory_loader)
+                train_gen = TFDataFeeder(partition='train', tfr_directory= args.use_tfrecords,  filename=args.use_exported_data, batch_size=args.batch_size, shuffle=args.shuffle, single=args.single, agg_dose=args.agg_dose, on_memory=args.on_memory_loader)
+                val_gen  = TFDataFeeder(partition='val', tfr_directory= args.use_tfrecords, filename=args.use_exported_data, batch_size=args.batch_size, shuffle=args.shuffle, single=args.single, agg_dose=args.agg_dose, on_memory=args.on_memory_loader)
+                test_gen = TFDataFeeder(partition='test', tfr_directory= args.use_tfrecords, filename=args.use_exported_data, batch_size=args.batch_size, shuffle=args.shuffle, single=args.single, agg_dose=args.agg_dose, on_memory=args.on_memory_loader)
             else:
                 pass
 
-            # TODO: steps_per_execution must be a command line argument
-            model.compile(loss=args.loss, optimizer=optimizer, metrics=[candle.mae, candle.r2], steps_per_execution=train_gen.steps)
 
             # calculate trainable and non-trainable params
             params.update(candle.compute_trainable_params(model))
@@ -286,76 +312,19 @@ def run( params, ipu_strategy = None ):
 
             logger.info('Data points per epoch: train = %d, val = %d, test = %d', train_gen.size, val_gen.size, test_gen.size)
             logger.info('Steps per epoch: train = %d, val = %d, test = %d', train_gen.steps, val_gen.steps, test_gen.steps)
-            history = model.fit(train_gen.tf_dataset,
+
+            model.compile(loss=args.loss, optimizer=optimizer, metrics=[candle.mae, candle.r2], steps_per_execution=args.steps_per_execution)
+
+            history = model.fit(train_gen.tf_dataset.prefetch(args.steps_per_execution),
                                 epochs=args.epochs,
                                 callbacks=callbacks,
                                 steps_per_epoch=train_gen.steps,
-                                validation_data=val_gen.tf_dataset,
-                                validation_steps=val_gen.steps, workers=0,
-                                use_multiprocessing=False
+                                validation_data=val_gen.tf_dataset.prefetch(args.steps_per_execution),
+                                validation_steps=val_gen.steps
                                 )
-
-            # prediction on holdout(test) when exists or use validation set
-            if test_gen.size > 0:
-                df_val = test_gen.get_response(copy=True)
-                y_val = df_val[target].values
-                y_val_pred = model.predict(test_gen.tf_dataset, steps=test_gen.steps + 1)
-                y_val_pred = y_val_pred[:test_gen.size]
-            else:
-                val_gen.reset()
-                y_val_pred = model.predict(val_gen.tf_dataset, steps=val_gen.steps + 1)
-                y_val_pred = y_val_pred[:val_gen.size]
-
-            del train_gen
-            del val_gen
-            del test_gen
-
-        y_val_pred = y_val_pred.flatten()
-
-        scores = evaluate_prediction(y_val, y_val_pred)
-        log_evaluation(scores, logger)
-
-        # df_val = df_val.assign(PredictedGrowth=y_val_pred, GrowthError=y_val_pred - y_val)
-        df_val['Predicted' + target] = y_val_pred
-        df_val[target + 'Error'] = y_val_pred - y_val
-        df_pred_list.append(df_val)
 
         candle.plot_metrics(history, title=None, skip_ep=0, outdir=os.path.dirname(args.save_path), add_lr=True)
 
-    pred_fname = prefix + '.predicted.tsv'
-    df_pred = pd.concat(df_pred_list)
-    if args.agg_dose:
-        if args.single:
-            df_pred.sort_values(['Sample', 'Drug1', target], inplace=True)
-        else:
-            df_pred.sort_values(['Source', 'Sample', 'Drug1', 'Drug2', target], inplace=True)
-    else:
-        if args.single:
-            df_pred.sort_values(['Sample', 'Drug1', 'Dose1', 'Growth'], inplace=True)
-        else:
-            df_pred.sort_values(['Sample', 'Drug1', 'Drug2', 'Dose1', 'Dose2', 'Growth'], inplace=True)
-    df_pred.to_csv(pred_fname, sep='\t', index=False, float_format='%.4g')
-
-    if args.cv > 1:
-        scores = evaluate_prediction(df_pred[target], df_pred['Predicted' + target])
-        log_evaluation(scores, logger, description='Combining cross validation folds:')
-
-    for test_source in loader.test_sep_sources:
-        test_gen = CombinedDataGenerator(loader, partition='test', batch_size=args.batch_size, source=test_source)
-        df_test = test_gen.get_response(copy=True)
-        y_test = df_test[target].values
-        n_test = len(y_test)
-        if n_test == 0:
-            continue
-        if args.no_gen:
-            x_test_list, y_test = test_gen.get_slice(size=test_gen.size, single=args.single)
-            y_test_pred = model.predict(x_test_list, batch_size=args.batch_size)
-        else:
-            y_test_pred = model.predict_generator(test_gen.flow(single=args.single), test_gen.steps)
-            y_test_pred = y_test_pred[:test_gen.size]
-        y_test_pred = y_test_pred.flatten()
-        scores = evaluate_prediction(y_test, y_test_pred)
-        log_evaluation(scores, logger, description='Testing on data from {} ({})'.format(test_source, n_test))
 
     if K.backend() == 'tensorflow':
         K.clear_session()
@@ -373,7 +342,7 @@ def main():
     ipu_config.configure_ipu_system()
 
     # Create an execution strategy.
-    strategy = ipu.ipu_strategy.IPUStrategy()
+    strategy = ipu.ipu_strategy.IPUStrategy(enable_dataset_iterators=False)
     run(params, strategy)
 
 

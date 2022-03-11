@@ -47,8 +47,7 @@ def parse_tfr_element(element):
   label = content['label']
   return (feature, label)
 
-def write_feature_to_tfr_short(feature, labels, filename:str="features"):
-  filename= filename+".tfrecords"
+def write_feature_to_tfr_short(feature, labels, filename:str="features.tfrecords"):
   writer = tf.io.TFRecordWriter(filename) #create a writer that'll store our data to disk
   count = 0
 

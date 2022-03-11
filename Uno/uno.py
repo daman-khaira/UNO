@@ -219,6 +219,10 @@ additional_definitions = [
         'type': str,
         'default': None,
         'help': 'use tensorflow records to train, validate'},
+    {'name': 'export_tfrecords',
+        'type': str,
+        'default': None,
+        'help': 'Directory to store TF records'},
 
 
     # IPU specific options

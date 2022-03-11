@@ -6,6 +6,8 @@ import logging
 import os
 import pickle
 import sys
+import shutil
+import json
 
 import numpy as np
 import pandas as pd
@@ -28,6 +30,9 @@ sys.path.append(lib_path)
 
 # import candle
 import file_utils
+
+from uno_tfr_utils import parse_tfr_element, write_feature_to_tfr_short
+import glob
 
 global_cache = {}
 
@@ -1121,96 +1126,31 @@ class DataFeeder(keras.utils.Sequence):
         else:
             self.store.close()
 
-class TF_ON_MEMORY_DATA( ):
+# Wrapper function for the keras.utils.Sequence class to generate batches in tf Dataset format
+class TFDataFeeder:
 
-    def __init__(self,  partition='train', filename=None, batch_size=32, shuffle=False, single=False, agg_dose=None, on_memory=False) -> None:
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.single = single
-        self.agg_dose = agg_dose
-        self.on_memory = on_memory
-        self.target = agg_dose if agg_dose is not None else 'Growth'
-        self.size = 0
-        self.steps = 0
+    def __init__( self, partition='train', filename=None, tfr_directory = None, batch_size=32, shuffle=False, single=False, agg_dose=None, on_memory=False ):
+        self.data_feeder = DataFeeder( partition=partition, filename=filename, batch_size=batch_size, shuffle=shuffle, single=single, agg_dose=agg_dose, on_memory=on_memory )
+        self.size = self.data_feeder.size
+        self.steps = self.data_feeder.steps
 
-        fid = pd.HDFStore(filename, mode='r')
-
-        input_keys = list(filter(lambda x: x.startswith('/x_{}'.format(partition)), fid.keys()))
-        output_key = 'y_{}'.format(partition)
-        self.input_size = len(input_keys)
-
-        if self.input_size > 0:
-            try:
-                y = fid.select('y_{}'.format(partition))
-                self.index = y.index
-                self.target_loc = y.columns.get_loc(self.target)
-            except KeyError:
-                self.index = []
-
-            self.size = len(self.index)
-            if self.size >= self.batch_size:
-                self.steps = self.size // self.batch_size
-            else:
-                self.steps = 1
-                self.batch_size = self.size
-
-            self.index_map = np.arange(self.steps)
-            if self.shuffle:
-                np.random.shuffle(self.index_map)
-
-            # Get Inputs
-            input_list = []
-            # List all the training input keys
-            for keys in input_keys:
-                input_list.append( fid[keys].to_numpy() )
-            self.input = tuple(input_list)
-
-            # Get Output
-            self.output = fid[output_key].iloc[:,self.target_loc].to_numpy()
-
-        fid.close()
+        self.tf_dataset = None
+        if tfr_directory is not None:
+            tfr_handler = TFRecordsHandler(partition=[partition], directory=tfr_directory)
+            self.tf_dataset, self.steps = tfr_handler.get_tfr_dataset(partition, batch_sz=batch_size)
+            self.size = self.steps*batch_size
+        else:        
+            if self.size > 0 and self.steps > 0:
+                if on_memory:
+                    self.tf_dataset = self.getTfdsFromTensorSlices(self.data_feeder).repeat()
+                else:
+                    self.tf_dataset = self.getTfdsFromGenerator(self.data_feeder).repeat()
 
     def __len__(self):
         return self.steps
     
-    def reset(self):
-        pass
-
-    def getDataset(self):
-        if self.size > 0:
-            ds = tf.data.Dataset.from_tensor_slices((self.input, self.output)).batch(self.batch_size, drop_remainder=True).prefetch(self.steps)
-            # if (self.shuffle):
-            #     ds = ds.shuffle(1000)
-            return ds
-        else:
-            return None
-
-    def get_response(self, copy=False):
-        if copy:
-            return np.copy(self.output)
-        else:
-            return self.output
-
-
-# Wrapper function for the keras.utils.Sequence class to generate batches in tf Dataset format
-class TFDataFeeder:
-
-    def __init__( self, partition='train', filename=None, batch_size=32, shuffle=False, single=False, agg_dose=None, on_memory=False ):
-        self.data_feeder = DataFeeder( partition=partition, filename=filename, batch_size=batch_size, shuffle=shuffle, single=single, agg_dose=agg_dose, on_memory=on_memory )
-        self.size = self.data_feeder.size
-        self.steps = self.data_feeder.steps
-        self.tf_dataset = None
-        if self.size > 0 and self.steps > 0:
-            if on_memory:
-                self.tf_dataset = self.getTfdsFromTensorSlices(self.data_feeder).repeat()
-            else:
-                self.tf_dataset = self.getTfdsFromGenerator(self.data_feeder).repeat()
-
-    def __len__(self):
-        return self.data_feeder.steps
-    
     def getSize(self):
-        return self.data_feeder.size
+        return self.size
 
     def getTfdsFromGenerator(self, data_feeder: DataFeeder):
 
@@ -1243,6 +1183,24 @@ class TFDataFeeder:
         x = [ data_feeder.dataframe['x_{0}_{1}'.format(data_feeder.partition, i)].to_numpy() for i in range(data_feeder.input_size) ]
         y = data_feeder.dataframe['y_{}'.format(data_feeder.partition)].iloc[:, data_feeder.target_loc]
         ds = tf.data.Dataset.from_tensor_slices((tuple(x), y)).batch(data_feeder.batch_size, drop_remainder=True)
+        return ds
+
+    def getTfdsFromTfrecords(self, tf_directory, batch_sz = 32 ):
+        feat_shape = 15580
+        feat_arr = [ 1, 1, 942, 5270, 2048, 5270, 2048 ]
+        num_steps = 4921
+        
+        def _split_tensor(feature, label):
+            feat = tf.reshape(feature,shape=[batch_sz, feat_shape])
+            split_feature = tf.split(feat, num_or_size_splits=feat_arr, axis=1)
+            return tuple(split_feature), label
+
+        #list files first
+        files = glob.glob(tf_directory+'/*.tfrecords')
+        print("Total files", len(files))
+
+        ds = tf.data.TFRecordDataset(files).map(parse_tfr_element, num_parallel_calls=tf.data.AUTOTUNE)
+        ds = ds.batch(batch_sz, drop_remainder=True).map(_split_tensor, num_parallel_calls=tf.data.AUTOTUNE).repeat()
         return ds
 
     def reset(self):
@@ -1374,6 +1332,92 @@ class CombinedDataGenerator(keras.utils.Sequence):
         while 1:
             x_list, y = self.get_slice(self.batch_size, single=single)
             yield x_list, y
+
+class TFRecordsHandler():
+    def __init__( self, partition:list = ['train', 'val', 'test' ],
+                        write: bool = False,
+                        directory:str=None,
+                        feature_len:int = 0,
+                        feature_sz_arr:list = None ) -> None:
+        self.data_dir_root = directory
+        self.json_file = os.path.join(self.data_dir_root, "summary.json")
+        self.write_mode = write
+        # Create the directories where parition results are stored
+        self.data_dirs_partition = {}
+        for p in partition:
+            curr_dir = os.path.join(self.data_dir_root,p)
+            self.data_dirs_partition[p] = curr_dir
+
+        if self.write_mode:
+            # Initialize directories
+            # Remove the data directory if it is available
+            shutil.rmtree(self.data_dir_root, ignore_errors=True)
+            for p in partition:
+                os.makedirs(self.data_dirs_partition[p])
+
+            self.tf_book_keeper = {'feature_len': feature_len, 'feature_sz_arr':feature_sz_arr }
+            #Initialize number of tf records for each partition to zero
+            for p in partition:
+                self.tf_book_keeper[p]={ 'file_count':0, 'record_count':0 }
+
+        else:
+            with open(self.json_file)as fp:
+                self.tf_book_keeper = json.load(fp)
+
+
+    def write_to_file(self, feature_mat, label_arr, partition):
+        file_count = self.tf_book_keeper[partition]['file_count']
+        dir_2_write = self.data_dirs_partition[partition]
+        filename = str(file_count)+".tfrecords"
+        file_path = os.path.join(dir_2_write, filename)
+
+        count = write_feature_to_tfr_short( feature_mat, label_arr, file_path)
+
+        # Increare the file counter and record counter
+        self.tf_book_keeper[partition]['file_count'] += 1
+        self.tf_book_keeper[partition]['record_count'] +=count
+
+        #Update the summary file
+        self.write_json()
+
+    def write_json(self):
+        with open(self.json_file,'w') as fp:
+            json.dump(self.tf_book_keeper,fp)
+
+    def get_tfr_dataset(self,partition, batch_sz=32):
+
+        if not partition in self.tf_book_keeper:
+            return None, 0
+
+        if self.tf_book_keeper[partition]['record_count'] <= 0:
+            return None, 0
+
+        feat_shape = self.tf_book_keeper['feature_len']
+        feat_arr = self.tf_book_keeper['feature_sz_arr']
+        num_records = self.tf_book_keeper[partition]['record_count']
+        if num_records < batch_sz:
+            batch_sz = num_records
+
+        def _split_tensor(feature, label):
+            feat = tf.reshape(feature,shape=[batch_sz, feat_shape])
+            split_feature = tf.split(feat, num_or_size_splits=feat_arr, axis=1)
+            return tuple(split_feature), label
+
+        #list files first
+        partition_dir = os.path.join(self.data_dir_root, partition)
+        files = glob.glob(partition_dir+'/*.tfrecords')
+        print("Total files", len(files))
+
+        ds = tf.data.TFRecordDataset(files).map(parse_tfr_element, num_parallel_calls=tf.data.AUTOTUNE)
+        ds = ds.batch(batch_sz, drop_remainder=True).map(_split_tensor, num_parallel_calls=tf.data.AUTOTUNE).repeat()
+
+        num_batches = (num_records//batch_sz)
+        return ds, num_batches
+
+
+    def __del__(self):
+        if self.write_mode:
+            self.write_json()
 
 
 def test_generator(loader):
