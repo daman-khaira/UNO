@@ -238,6 +238,10 @@ additional_definitions = [
         'type': int,
         'default': 1,
         'help': 'Number of steps over which gradient is accumulated'}
+    {'name': 'num_io_tiles',
+        'type': int,
+        'default': -1,
+        'help': 'Number of IPU tiles to be dedicated for I/O. It must be [0-1476]'}
 
 
 ]
