@@ -237,7 +237,7 @@ additional_definitions = [
     {'name': 'gradient_accumulation_steps',
         'type': int,
         'default': 1,
-        'help': 'Number of steps over which gradient is accumulated'}
+        'help': 'Number of steps over which gradient is accumulated'},
     {'name': 'num_io_tiles',
         'type': int,
         'default': -1,
