@@ -336,10 +336,20 @@ def run( params, ipu_strategy = None ):
 
 def main():
     params = initialize_parameters()
+    
+    # Number of replicas
+    num_ipus = params['num_replicas']
+    num_io_tiles = params['num_io_tiles']
+
     # Standard IPU TensorFlow setup.
     ipu_config = ipu.config.IPUConfig()
-    ipu_config.auto_select_ipus = 1
+    ipu_config.auto_select_ipus = num_ipus
     ipu_config.configure_ipu_system()
+
+    # Set number of tiles only for I/O
+    if num_io_tiles > 0:
+        ipu_config.io_tiles.num_io_tiles = num_io_tiles
+        ipu_config.io_tiles.place_ops_on_io_tiles = True
 
     # Create an execution strategy.
     strategy = ipu.ipu_strategy.IPUStrategy(enable_dataset_iterators=False)
