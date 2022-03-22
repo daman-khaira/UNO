@@ -1339,7 +1339,7 @@ class TFRecordsHandler():
                         directory:str=None,
                         feature_len:int = 0,
                         feature_sz_arr:list = None ) -> None:
-        self.data_dir_root = directory
+        self.data_dir_root = os.path.abspath(directory)
         self.json_file = os.path.join(self.data_dir_root, "summary.json")
         self.write_mode = write
         # Create the directories where parition results are stored
@@ -1384,7 +1384,7 @@ class TFRecordsHandler():
         with open(self.json_file,'w') as fp:
             json.dump(self.tf_book_keeper,fp)
 
-    def get_tfr_dataset(self,partition, batch_sz=32):
+    def get_tfr_dataset(self, partition, batch_sz=32):
 
         if not partition in self.tf_book_keeper:
             return None, 0
