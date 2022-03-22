@@ -313,15 +313,22 @@ def run( params, ipu_strategy = None ):
             logger.info('Data points per epoch: train = %d, val = %d, test = %d', train_gen.size, val_gen.size, test_gen.size)
             logger.info('Steps per epoch: train = %d, val = %d, test = %d', train_gen.steps, val_gen.steps, test_gen.steps)
 
+            model.set_asynchronous_callbacks(asynchronous=True)
+            
+            # Adjust steps per execution
+            # If user specified a negative number for steps per execution, it means entire epoch is run on IPU
+            if ( args.steps_per_execution < 0 ):
+                args.steps_per_execution = train_gen.steps
+
             model.compile(loss=args.loss, optimizer=optimizer, metrics=[candle.mae, candle.r2], steps_per_execution=args.steps_per_execution)
 
-            history = model.fit(train_gen.tf_dataset.prefetch(args.steps_per_execution),
-                                epochs=args.epochs,
-                                callbacks=callbacks,
-                                steps_per_epoch=train_gen.steps,
-                                validation_data=val_gen.tf_dataset.prefetch(args.steps_per_execution),
-                                validation_steps=val_gen.steps
-                                )
+            history = model.fit( train_gen.tf_dataset,
+                                 epochs=args.epochs,
+                                 callbacks=callbacks,
+                                 steps_per_epoch=(train_gen.steps//args.steps_per_execution)*args.steps_per_execution,
+                                 validation_data=val_gen.tf_dataset,
+                                 validation_steps=(val_gen.steps)
+                               )
 
         candle.plot_metrics(history, title=None, skip_ep=0, outdir=os.path.dirname(args.save_path), add_lr=True)
 
@@ -344,12 +351,13 @@ def main():
     # Standard IPU TensorFlow setup.
     ipu_config = ipu.config.IPUConfig()
     ipu_config.auto_select_ipus = num_ipus
-    ipu_config.configure_ipu_system()
-
     # Set number of tiles only for I/O
     if num_io_tiles > 0:
-        ipu_config.io_tiles.num_io_tiles = num_io_tiles
-        ipu_config.io_tiles.place_ops_on_io_tiles = True
+      ipu_config.io_tiles.num_io_tiles = num_io_tiles
+      ipu_config.io_tiles.place_ops_on_io_tiles = True
+
+    ipu_config.configure_ipu_system()
+
 
     # Create an execution strategy.
     strategy = ipu.ipu_strategy.IPUStrategy(enable_dataset_iterators=False)
