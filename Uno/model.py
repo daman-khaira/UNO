@@ -6,6 +6,7 @@ from tensorflow import keras
 from tensorflow.keras import backend as K
 from tensorflow.keras.layers import Input, Dense, Dropout
 from tensorflow.keras.models import Model
+from tensorflow.python import ipu
 
 # Importing candle libraries
 file_path = os.path.dirname(os.path.realpath(__file__))
@@ -37,7 +38,7 @@ def build_feature_model(input_shape, name='', dense_layers=[1000, 1000],
             if permanent_dropout:
                 h = PermanentDropout(dropout_rate)(h)
             else:
-                h = Dropout(dropout_rate)(h)
+                h = ipu.rand_ops.dropout(h, dropout_rate)
         if residual:
             try:
                 h = keras.layers.add([h, x])
@@ -47,7 +48,7 @@ def build_feature_model(input_shape, name='', dense_layers=[1000, 1000],
     return model
 
 
-def build_model(loader, args, permanent_dropout=True, logger=None):
+def build_model(loader, args, permanent_dropout=False, logger=None):
     input_models = {}
     dropout_rate = args.dropout
 
@@ -96,7 +97,7 @@ def build_model(loader, args, permanent_dropout=True, logger=None):
             if permanent_dropout:
                 h = PermanentDropout(dropout_rate)(h)
             else:
-                h = Dropout(dropout_rate)(h)
+                h = ipu.rand_ops.dropout(h, dropout_rate)
         if args.residual:
             try:
                 h = keras.layers.add([h, x])
