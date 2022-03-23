@@ -3,7 +3,7 @@
 from __future__ import division, print_function
 
 import logging
-import os, sys, shutil
+import os, sys, time
 
 import numpy as np
 import pandas as pd
@@ -33,6 +33,24 @@ from uno_tfr_utils import *
 
 logger = logging.getLogger(__name__)
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
+def benchmark_dataset(dataset: TFDataFeeder, num_epochs: int = 1):
+    print("BENCHMARKING DATASET")
+    out = ipu.dataset_benchmark.dataset_benchmark(dataset.tf_dataset.prefetch(240), 1, num_epochs*dataset.steps)
+    print(out)
+
+    print("BENCHMARKING DATASET CPU")
+    tot_samples = num_epochs*dataset.steps
+    tic = time.perf_counter()
+    i = 1
+    for _,_ in dataset.tf_dataset.prefetch(240):
+        i += 1
+        if (i > tot_samples ):
+            break
+
+    toc = time.perf_counter()
+    print("SAMPLES PER SECOND: ", (tot_samples)/(toc-tic))
+
 
 
 def extension_from_parameters(args):
@@ -273,6 +291,7 @@ def run( params, ipu_strategy = None ):
                 train_gen = TFDataFeeder(partition='train', tfr_directory= args.use_tfrecords,  filename=args.use_exported_data, batch_size=args.batch_size, shuffle=args.shuffle, single=args.single, agg_dose=args.agg_dose, on_memory=args.on_memory_loader)
                 val_gen  = TFDataFeeder(partition='val', tfr_directory= args.use_tfrecords, filename=args.use_exported_data, batch_size=args.batch_size, shuffle=args.shuffle, single=args.single, agg_dose=args.agg_dose, on_memory=args.on_memory_loader)
                 test_gen = TFDataFeeder(partition='test', tfr_directory= args.use_tfrecords, filename=args.use_exported_data, batch_size=args.batch_size, shuffle=args.shuffle, single=args.single, agg_dose=args.agg_dose, on_memory=args.on_memory_loader)
+                # benchmark_dataset(train_gen,10)
             else:
                 pass
 
