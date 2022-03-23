@@ -15,6 +15,7 @@ import tensorflow as tf
 from tensorflow import keras
 
 from itertools import cycle, islice
+import random
 
 try:
     from sklearn.impute import SimpleImputer as Imputer
@@ -1137,7 +1138,7 @@ class TFDataFeeder:
         self.tf_dataset = None
         if tfr_directory is not None:
             tfr_handler = TFRecordsHandler(partition=[partition], directory=tfr_directory)
-            self.tf_dataset, self.steps = tfr_handler.get_tfr_dataset(partition, batch_sz=batch_size)
+            self.tf_dataset, self.steps = tfr_handler.get_tfr_dataset(partition, batch_sz=batch_size, shuffle=True)
             self.size = self.steps*batch_size
         else:        
             if self.size > 0 and self.steps > 0:
@@ -1384,7 +1385,7 @@ class TFRecordsHandler():
         with open(self.json_file,'w') as fp:
             json.dump(self.tf_book_keeper,fp)
 
-    def get_tfr_dataset(self, partition, batch_sz=32):
+    def get_tfr_dataset(self, partition, batch_sz=32, shuffle=True):
 
         if not partition in self.tf_book_keeper:
             return None, 0
@@ -1406,11 +1407,22 @@ class TFRecordsHandler():
         #list files first
         partition_dir = os.path.join(self.data_dir_root, partition)
         files = glob.glob(partition_dir+'/*.tfrecords')
-        print("Total files", len(files))
+        if shuffle:
+            random.shuffle(files)
 
-        ds = tf.data.TFRecordDataset(files).map(parse_tfr_element, num_parallel_calls=tf.data.AUTOTUNE)
-        ds = ds.batch(batch_sz, drop_remainder=True).map(_split_tensor, num_parallel_calls=tf.data.AUTOTUNE).repeat()
+        ds = tf.data.TFRecordDataset(files, num_parallel_reads=10 )
 
+        if shuffle:
+            ds = ds.shuffle(len(files))
+        ds = ds.map(parse_tfr_element, num_parallel_calls=tf.data.AUTOTUNE)
+        ds = ds.batch(batch_sz, drop_remainder=True).map(_split_tensor, num_parallel_calls=tf.data.AUTOTUNE)
+        if shuffle:
+            num_buffer = 4096//batch_sz
+            ds = ds.shuffle(num_buffer)
+        
+        # repeat
+        ds = ds.repeat()
+    
         num_batches = (num_records//batch_sz)
         return ds, num_batches
 
