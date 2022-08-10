@@ -880,17 +880,17 @@ class CombinedDataLoader(object):
             return
 
         # rebuild cache equivalent from the exported dataset
-        if use_exported_data is not None:
-            with pd.HDFStore(use_exported_data, 'r') as store:
-                if '/model' in store.keys():
-                    self.input_features = store.get_storer('model').attrs.input_features
-                    self.feature_shapes = store.get_storer('model').attrs.feature_shapes
-                    self.input_dim = sum([np.prod(self.feature_shapes[x]) for x in self.input_features.values()])
-                    self.test_sep_sources = []
-                    return
-                else:
-                    logger.warning('\nExported dataset does not have model info. Please rebuild the dataset.\n')
-                    raise ValueError('Could not load model info from the dataset:', use_exported_data)
+        # if use_exported_data is not None:
+        #     with pd.HDFStore(use_exported_data, 'r') as store:
+        #         if '/model' in store.keys():
+        #             self.input_features = store.get_storer('model').attrs.input_features
+        #             self.feature_shapes = store.get_storer('model').attrs.feature_shapes
+        #             self.input_dim = sum([np.prod(self.feature_shapes[x]) for x in self.input_features.values()])
+        #             self.test_sep_sources = []
+        #             return
+        #         else:
+        #             logger.warning('\nExported dataset does not have model info. Please rebuild the dataset.\n')
+        #             raise ValueError('Could not load model info from the dataset:', use_exported_data)
 
         logger.info('Loading data from scratch ...')
 

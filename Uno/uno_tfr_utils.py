@@ -42,10 +42,10 @@ def parse_tfr_element(element):
   
   feature_len = content['feature_len']
   feature_raw  = content['feature']
-  feature = tf.io.parse_tensor(feature_raw, out_type=tf.float32)
+  feature = tf.io.parse_tensor(feature_raw, out_type=tf.float16)
   feature = tf.reshape(feature, shape=[feature_len])
   label = content['label']
-  return (feature, label)
+  return (feature, tf.cast(label, dtype=tf.float16))
 
 def write_feature_to_tfr_short(feature, labels, filename:str="features.tfrecords"):
   writer = tf.io.TFRecordWriter(filename) #create a writer that'll store our data to disk

@@ -7,7 +7,7 @@ import os, sys, time
 
 import numpy as np
 import pandas as pd
-
+import pdb
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import backend as K
@@ -34,7 +34,7 @@ from uno_tfr_utils import *
 logger = logging.getLogger(__name__)
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
-def benchmark_dataset(dataset: TFDataFeeder, num_epochs: int = 1):
+def benchmark_dataset(dataset, num_epochs:int = 1):
     print("BENCHMARKING DATASET")
     out = ipu.dataset_benchmark.dataset_benchmark(dataset.tf_dataset.prefetch(240), 1, num_epochs*dataset.steps)
     print(out)
@@ -187,6 +187,7 @@ def exportData(args: dict, loader:CombinedDataLoader):
 
     # Open a pandas file handler
     store = pd.HDFStore(fname, complevel=9, complib='blosc:lz4') if (args.export_data is not None) else None
+    # store = None
 
     # Record the feature length and array for TF Records
     feature_len = 0
@@ -207,15 +208,15 @@ def exportData(args: dict, loader:CombinedDataLoader):
             x_list, y = gen.get_slice(size=args.batch_size, dataframe=True, single=args.single)
 
             if args.export_tfrecords is not None:
-                feature_mat = np.concatenate( [fi.values.astype(np.float32) for fi in x_list], axis=1)
-                y_arr = y[target].values.astype(np.float32)
+                feature_mat = np.concatenate( [fi.values.astype(np.float16) for fi in x_list], axis=1)
+                y_arr = y[target].values.astype(np.float16)
                 tfr_writer.write_to_file(feature_mat, y_arr, partition)
 
             if store is not None:
                 for j, input_feature in enumerate(x_list):
                     input_feature.columns = [''] * len(input_feature.columns)
-                    store.append('x_{}_{}'.format(partition, j), input_feature.astype('float32'), format='table')
-                store.append('y_{}'.format(partition), y.astype({target: 'float32'}), format='table', min_itemsize=config_min_itemsize)
+                    store.append('x_{}_{}'.format(partition, j), input_feature.astype('float16'), format='table')
+                store.append('y_{}'.format(partition), y.astype({target: 'float16'}), format='table', min_itemsize=config_min_itemsize)
             
 
     # save input_features and feature_shapes from loader
@@ -339,8 +340,13 @@ def run( params, ipu_strategy = None ):
             if ( args.steps_per_execution < 0 ):
                 args.steps_per_execution = train_gen.steps
 
+            # for feat,lbl in train_gen.tf_dataset.take(1):
+            #     print(lbl)
+            #     pdb.set_trace()
+            #     exit(1)
             model.compile(loss=args.loss, optimizer=optimizer, metrics=[candle.mae, candle.r2], steps_per_execution=args.steps_per_execution)
 
+            
             history = model.fit( train_gen.tf_dataset,
                                  epochs=args.epochs,
                                  callbacks=callbacks,
@@ -363,17 +369,26 @@ def run( params, ipu_strategy = None ):
 def main():
     params = initialize_parameters()
     
+    tf.keras.backend.set_floatx('float16')
     # Number of replicas
     num_ipus = params['num_replicas']
     num_io_tiles = params['num_io_tiles']
 
-    # Standard IPU TensorFlow setup.
+    #Standard IPU TensorFlow setup.
     ipu_config = ipu.config.IPUConfig()
     ipu_config.auto_select_ipus = num_ipus
-    # Set number of tiles only for I/O
+    #Set number of tiles only for I/O
     if num_io_tiles > 0:
-      ipu_config.io_tiles.num_io_tiles = num_io_tiles
-      ipu_config.io_tiles.place_ops_on_io_tiles = True
+     ipu_config.io_tiles.num_io_tiles = num_io_tiles
+     ipu_config.io_tiles.place_ops_on_io_tiles = True
+
+    matmul_options = {"partialsType": 'half'}
+    ipu_config.matmuls.poplar_options = matmul_options
+
+    # Set convolution options, including the "partials" and "available memory proportion"
+    # as in the above matmul options.
+    conv_options = matmul_options.copy()
+    ipu_config.convolutions.poplar_options = conv_options
 
     ipu_config.configure_ipu_system()
 
@@ -381,6 +396,7 @@ def main():
     # Create an execution strategy.
     strategy = ipu.ipu_strategy.IPUStrategy(enable_dataset_iterators=False)
     run(params, strategy)
+    # run(params, None)
 
 
 if __name__ == '__main__':
